@@ -21,7 +21,7 @@ class ProxisSpider(scrapy.Spider):
         'AUTOTHROTTLE_START_DELAY': 10,
         'AUTOTHROTTLE_MAX_DELAY': 300,
         'ROBOTSTXT_OBEY': True,
-        'HTTPERROR_ALLOWED_CODES': [429],
+        'HTTPERROR_ALLOWED_CODES': [429, 403],
     }
 
     def __init__(self, *args, **kwargs):
@@ -63,17 +63,14 @@ class ProxisSpider(scrapy.Spider):
             )
 
     def send_proxies(self, response):
-        if response.status == 429:
-            self.logger.error("429 Too Many Requests on /task")
+        if response.status in (429, 403):
+            self.logger.warning(f"{response.status} on /task. Waiting 30s before retry...")
             time.sleep(30)
-            return scrapy.Request(
-                url=self.api_urls,
-                callback=self.send_proxies,
-                meta={'cookiejar': 1},
-                dont_filter=True
-            )
+            yield response.request.replace(dont_filter=True)
+            return
 
-        start = self.batch_index * self.batch_size
+        batch_index = response.meta.get('batch_index', self.batch_index)
+        start = batch_index * self.batch_size
         end = start + self.batch_size
         batch = self.list_proxis[start:end]
 
@@ -81,27 +78,28 @@ class ProxisSpider(scrapy.Spider):
             self.logger.info("All batches sent.")
             return
 
-        return scrapy.Request(
+        yield scrapy.Request(
             url="https://test-rg8.ddns.net/api/get_token",
             callback=self.post_proxies,
             meta={
                 'cookiejar': 1,
                 'batch': batch,
-                'batch_index': self.batch_index
+                'batch_index': batch_index
             },
             dont_filter=True
         )
 
     def post_proxies(self, response):
-        if response.status == 429:
-            self.logger.warning("429 on get_token, retrying /task in 30s")
+        if response.status in (429, 403):
+            self.logger.warning(f"{response.status} on /get_token. Returning to /task after 30s")
             time.sleep(30)
-            return scrapy.Request(
+            yield scrapy.Request(
                 url=self.api_urls,
                 callback=self.send_proxies,
-                meta={'cookiejar': 1},
+                meta={'cookiejar': 1, 'batch_index': response.meta.get('batch_index', 0)},
                 dont_filter=True
             )
+            return
 
         batch = response.meta['batch']
         batch_index = response.meta['batch_index']
@@ -112,7 +110,7 @@ class ProxisSpider(scrapy.Spider):
             "proxies": ", ".join([f"{p['ip']}:{p['port']}" for p in batch])
         }
 
-        return JsonRequest(
+        yield JsonRequest(
             url="https://test-rg8.ddns.net/api/post_proxies",
             data=payload,
             callback=self.handle_response,
@@ -126,15 +124,16 @@ class ProxisSpider(scrapy.Spider):
         )
 
     def handle_response(self, response):
-        if response.status == 429:
-            self.logger.warning("429 on post_proxies, retrying /task in 30s")
+        if response.status in (429, 403):
+            self.logger.warning(f"{response.status} on /post_proxies. Returning to /task after 30s")
             time.sleep(30)
-            return scrapy.Request(
+            yield scrapy.Request(
                 url=self.api_urls,
                 callback=self.send_proxies,
-                meta={'cookiejar': 1},
+                meta={'cookiejar': 1, 'batch_index': response.meta.get('batch_index', 0)},
                 dont_filter=True
             )
+            return
 
         try:
             data = response.json()
@@ -151,7 +150,7 @@ class ProxisSpider(scrapy.Spider):
         yield scrapy.Request(
             url=self.api_urls,
             callback=self.send_proxies,
-            meta={'cookiejar': 1},
+            meta={'cookiejar': 1, 'batch_index': self.batch_index},
             dont_filter=True
         )
 
@@ -176,5 +175,3 @@ class ProxisSpider(scrapy.Spider):
 
         with open("time.txt", "w", encoding="utf-8") as f:
             f.write(final_time)
-
-        self.logger.info(f"Spider closed: total time = {final_time}")
